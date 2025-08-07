@@ -1,141 +1,187 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.static('public'));
+app.use(express.json());
 
-let expenseData = {
-  users: [
-    { id: 'matt', name: 'Matt', color: 'bg-blue-500', connected: false, 
-lastSeen: null },
-    { id: 'eileen', name: 'Eileen', color: 'bg-pink-500', connected: 
-false, lastSeen: null }
-  ],
-  transactions: [],
-  createdAt: new Date().toISOString()
-};
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir);
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
   }
 });
 
-const upload = multer({ storage: storage });
+// In-memory storage for expenses (in production, you'd use a database)
+let expenses = [];
+let nextId = 1;
 
-app.post('/api/connect/:userId', (req, res) => {
-  const { userId } = req.params;
+// Root route
+app.get('/', (req, res) => {
+  res.json({ 
+    message: "💕 Matt and Eileen's Expense Tracker Server is running!",
+    endpoints: [
+      'GET /api/expenses - Get all expenses',
+      'POST /api/expenses - Add new expense',
+      'PUT /api/expenses/:id - Update expense',
+      'DELETE /api/expenses/:id - Delete expense',
+      'POST /api/upload-csv - Upload CSV file'
+    ]
+  });
+});
+
+// Get all expenses
+app.get('/api/expenses', (req, res) => {
+  res.json(expenses);
+});
+
+// Add new expense
+app.post('/api/expenses', (req, res) => {
+  const { user, amount, description, date, category } = req.body;
   
-  if (userId !== 'matt' && userId !== 'eileen') {
-    return res.status(400).json({ error: 'Invalid user' });
+  // Validate required fields
+  if (!user || !amount || !description || !date) {
+    return res.status(400).json({ error: 'Missing required fields' });
   }
-
-  const user = expenseData.users.find(u => u.id === userId);
-  if (user) {
-    user.connected = true;
-    user.lastSeen = new Date().toISOString();
+  
+  // Validate user
+  if (user !== 'Matt' && user !== 'Eileen') {
+    return res.status(400).json({ error: 'Invalid user. Only Matt and Eileen are allowed.' });
   }
+  
+  const expense = {
+    id: nextId++,
+    user,
+    amount: parseFloat(amount),
+    description,
+    date,
+    category: category || 'Other',
+    createdAt: new Date().toISOString()
+  };
+  
+  expenses.push(expense);
+  res.status(201).json(expense);
+});
 
+// Update expense
+app.put('/api/expenses/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const { user, amount, description, date, category } = req.body;
+  
+  const expenseIndex = expenses.findIndex(exp => exp.id === id);
+  
+  if (expenseIndex === -1) {
+    return res.status(404).json({ error: 'Expense not found' });
+  }
+  
+  // Validate user
+  if (user && user !== 'Matt' && user !== 'Eileen') {
+    return res.status(400).json({ error: 'Invalid user. Only Matt and Eileen are allowed.' });
+  }
+  
+  // Update expense
+  if (user) expenses[expenseIndex].user = user;
+  if (amount) expenses[expenseIndex].amount = parseFloat(amount);
+  if (description) expenses[expenseIndex].description = description;
+  if (date) expenses[expenseIndex].date = date;
+  if (category) expenses[expenseIndex].category = category;
+  
+  expenses[expenseIndex].updatedAt = new Date().toISOString();
+  
+  res.json(expenses[expenseIndex]);
+});
+
+// Delete expense
+app.delete('/api/expenses/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const expenseIndex = expenses.findIndex(exp => exp.id === id);
+  
+  if (expenseIndex === -1) {
+    return res.status(404).json({ error: 'Expense not found' });
+  }
+  
+  const deletedExpense = expenses.splice(expenseIndex, 1)[0];
+  res.json(deletedExpense);
+});
+
+// Upload CSV
+app.post('/api/upload-csv', upload.single('file'), (req, res) => {
+  const { user } = req.body;
+  
+  if (!user || (user !== 'Matt' && user !== 'Eileen')) {
+    return res.status(400).json({ error: 'Invalid user. Only Matt and Eileen are allowed.' });
+  }
+  
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+  
+  // Convert buffer to string
+  const csvData = req.file.buffer.toString('utf8');
+  
+  // Basic CSV parsing (in production, you might want to use a proper CSV parser)
+  const lines = csvData.split('\n').filter(line => line.trim());
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  
+  let addedExpenses = [];
+  
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+    
+    if (values.length >= headers.length) {
+      // Try to find amount, description, and date columns
+      let amount, description, date, category = 'Imported';
+      
+      // Look for common column names
+      headers.forEach((header, index) => {
+        const lowerHeader = header.toLowerCase();
+        if (lowerHeader.includes('amount') || lowerHeader.includes('debit') || lowerHeader.includes('withdrawal')) {
+          amount = parseFloat(values[index]) || 0;
+        }
+        if (lowerHeader.includes('description') || lowerHeader.includes('merchant') || lowerHeader.includes('payee')) {
+          description = values[index];
+        }
+        if (lowerHeader.includes('date') || lowerHeader.includes('transaction date')) {
+          date = values[index];
+        }
+        if (lowerHeader.includes('category') || lowerHeader.includes('type')) {
+          category = values[index] || 'Imported';
+        }
+      });
+      
+      if (amount && description && date) {
+        const expense = {
+          id: nextId++,
+          user,
+          amount: Math.abs(amount), // Make sure amount is positive
+          description,
+          date,
+          category,
+          createdAt: new Date().toISOString()
+        };
+        
+        expenses.push(expense);
+        addedExpenses.push(expense);
+      }
+    }
+  }
+  
   res.json({
-    success: true,
-    user: user,
-    data: expenseData,
-    message: `Welcome ${user.name}!`
+    message: `Successfully imported ${addedExpenses.length} expenses`,
+    expenses: addedExpenses
   });
 });
 
-app.get('/api/data', (req, res) => {
-  res.json(expenseData);
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-app.post('/api/transactions', (req, res) => {
-  const { userId, transactions } = req.body;
-
-  if (userId !== 'matt' && userId !== 'eileen') {
-    return res.status(400).json({ error: 'Invalid user' });
-  }
-
-  const newTransactions = transactions.map((t, index) => ({
-    ...t,
-    userId: userId,
-    id: `${userId}-${Date.now()}-${index}`,
-    uploadedAt: new Date().toISOString()
-  }));
-
-  expenseData.transactions.push(...newTransactions);
-
-  res.json({
-    success: true,
-    message: `Added ${newTransactions.length} transactions`,
-    transactions: newTransactions
-  });
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`💕 Matt and Eileen's Expense Tracker Server running on port ${PORT}`);
 });
-
-app.put('/api/transactions/:transactionId', (req, res) => {
-  const { transactionId } = req.params;
-  const { category, updatedBy } = req.body;
-
-  const transaction = expenseData.transactions.find(t => t.id === 
-transactionId);
-  if (!transaction) {
-    return res.status(404).json({ error: 'Transaction not found' });
-  }
-
-  transaction.category = category;
-  transaction.updatedAt = new Date().toISOString();
-  transaction.updatedBy = updatedBy;
-
-  res.json({ success: true, transaction: transaction });
-});
-
-app.delete('/api/transactions/:transactionId', (req, res) => {
-  const { transactionId } = req.params;
-  const initialLength = expenseData.transactions.length;
-  expenseData.transactions = expenseData.transactions.filter(t => t.id !== 
-transactionId);
-
-  if (expenseData.transactions.length === initialLength) {
-    return res.status(404).json({ error: 'Transaction not found' });
-  }
-
-  res.json({ success: true, message: 'Transaction deleted' });
-});
-
-app.post('/api/reset', (req, res) => {
-  expenseData.transactions = [];
-  expenseData.users.forEach(u => {
-    u.connected = false;
-    u.lastSeen = null;
-  });
-  res.json({ success: true, message: 'All data cleared' });
-});
-
-app.post('/api/heartbeat/:userId', (req, res) => {
-  const { userId } = req.params;
-  const user = expenseData.users.find(u => u.id === userId);
-  if (user) {
-    user.lastSeen = new Date().toISOString();
-  }
-  res.json({ success: true });
-});
-
-app.listen(PORT, () => {
-  console.log(`💕 Matt and Eileen's Expense Tracker Server running on 
-http://localhost:${PORT}`);
-});
-
-module.exports = app;
